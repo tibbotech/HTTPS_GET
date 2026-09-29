@@ -1,0 +1,53 @@
+'DEFINES-------------------------------------------------------------
+
+'--- Network ---
+'1 = obtain IP, netmask and gateway from a DHCP server; 0 = use the static values below.
+#define USE_DHCP 1
+const DEVICE_IP   = "192.168.1.218"
+const DEVICE_MASK = "255.255.255.0"
+const DEVICE_GW   = "192.168.1.1"
+
+'DNS server used to resolve SERVER_HOST.
+const DNS_SERVER = "8.8.8.8"
+
+'--- Remote server ---
+'SERVER_HOST is used for DNS, for the HTTP "Host:" header and for the TLS name check,
+'so it must match the name (or IP) on the server's certificate.
+'If SERVER_HOST is an IP address, the DNS lookup is skipped.
+const SERVER_HOST = "aws.amazon.com"	'"192.168.1.70"
+const SERVER_PORT = 443
+const SERVER_PATH = "/robots.txt"		'"/"
+
+'ROM file name: the CA certificate (DER) that signed the server's certificate.
+#define CA_CERT "asw_ca_cert.der"	'"ca_cert.der"
+
+'--- HTTPS socket buffers ---
+'1 page = 256 bytes. 6 pages suits ECDSA P-256; raise to 8 for RSA 2048.
+#define TLS_RX_BUFF 6
+#define TLS_TX_BUFF 6
+
+'Give up on a request that has not finished within this many on_sys_timer ticks (0.5 s each).
+const REQUEST_TIMEOUT_TICKS = 60
+
+'--- Library options ---
+
+#define WLN_AVAILABLE 0
+
+'1 = print the libraries' own debug messages, 0 = quiet
+#define DHCP_DEBUG_PRINT 1
+#define DNS_DEBUG_PRINT 1
+
+'INCLUDES------------------------------------------------------------
+include "sock.tbh"
+include "dns.tbh"
+include "dhcp.tbh"
+
+'DECLARATIONS--------------------------------------------------------
+declare sub boot()
+declare sub net_ready()
+declare sub start_request()
+declare sub start_connect(ip as string)
+declare sub end_request(reason as string)
+declare function is_ip(s as string) as no_yes
+declare sub https_get_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub https_get_data()

@@ -1,0 +1,1520 @@
+
+'***********************************************************************************************************
+'			DHCP LIBRARY
+'			(Works with NET, WLN)
+'***********************************************************************************************************
+'
+' CONCURRENCY MODEL
+' -----------------
+' The library uses ONE shared UDP socket for all interfaces. Access is serialised
+' by dhcp_owner: an interface may only enter a socket-using phase while the socket
+' is free or already owned by it. Everything else waits its turn and is retried on
+' the next tick, with a rotating scan order so no interface can be starved.
+'
+' Serialisation is not merely a memory saving. The DISCOVER preamble in
+' dhcp_sock_open() manipulates sock.inconenabledmaster, which is a GLOBAL setting,
+' and walks the whole socket table via discard_sockets(). Two interfaces running
+' that concurrently would corrupt each other, so a critical section would be
+' required in any case.
+'
+' Per-interface state is indexed DIRECTLY by the pl_sock_interfaces value. State
+' that only lives for the duration of a single transaction is held in scalars,
+' because serialisation guarantees at most one transaction is ever in flight.
+'
+' TIMEBASE
+' --------
+' Timers are simple countdowns decremented once per dhcp_proc_timer() call, scaled
+' from seconds by DHCP_TICKS_PER_SEC. sys.timercountms is deliberately NOT used, so
+' this library runs unchanged on T1000-based (gen-1) devices. A timer value of 0
+' means "disabled" -- never arm a timer with 0.
+'
+'***********************************************************************************************************
+
+include "global.tbh"
+
+'------------------------------------------------------------------------------
+const DHCP_STAMP1="DHCP("
+const DHCP_STAMP2=")> "
+const DHCP_CR_LF=chr(13)+chr(10)
+const DHCP_MIN_BUFFER_SPACE=700	'necessary! must be able to hold a full DHCP message
+const DHCP_SOCK_BUFF_PAGES=3	'necessary!
+const DHCP_INIT_SIGNATURE=&h3D4E
+const DHCP_SOCK_GET_SIGNATURE="DHCP"
+const DHCP_WLN_EXCHANGE_DELAY_CONST=4
+const DHCP_NO_OWNER=255
+
+'------------------------------------------------------------------------------
+enum en_dhcp_phases
+	DHCP_PHASE_DISCOVER,
+	DHCP_PHASE_DISCOVER_REPLY,
+	DHCP_PHASE_REQUEST,
+	DHCP_PHASE_REQUEST_REPLY,
+	DHCP_PHASE_IDLE,
+	DHCP_PHASE_OFF
+end enum
+
+'------------------------------------------------------------------------------
+'Lease state, per RFC 2131 4.4.5. This is orthogonal to the phase above: the
+'phase says which message is in flight, the lease state says why.
+'
+'  NONE       no usable address. A REQUEST here is a SELECTING request --
+'             ciaddr 0, options 50 and 54 present, broadcast.
+'  BOUND      holding a valid lease, waiting for T1.
+'  RENEWING   past T1. Unicast REQUEST to the server that granted the lease,
+'             ciaddr set, no option 50 or 54. At T2 -> REBINDING.
+'  REBINDING  past T2. Same REQUEST but broadcast, so any server may answer.
+'             At lease expiry -> surrender the address and go back to NONE.
+enum en_dhcp_lease_states
+	DHCP_LEASE_NONE,
+	DHCP_LEASE_BOUND,
+	DHCP_LEASE_RENEWING,
+	DHCP_LEASE_REBINDING
+end enum
+
+'------------------------------------------------------------------------------
+'Result of dhcp_sock_open(). PENDING means the socket is mid-transition and the
+'caller should retry on the next tick without counting a retry attempt -- this is
+'what keeps the library from blocking inside an event handler.
+enum en_dhcp_open_result
+	DHCP_OPEN_OK,
+	DHCP_OPEN_PENDING,
+	DHCP_OPEN_FAILED
+end enum
+
+'------------------------------------------------------------------------------
+declare sub dhcp_proc_one_interface(interface as pl_sock_interfaces)
+declare sub dhcp_error(interface as pl_sock_interfaces)
+declare function dhcp_sock_open(interface as pl_sock_interfaces,phase as en_dhcp_phases) as en_dhcp_open_result
+declare sub dhcp_sock_close()
+declare sub dhcp_release_socket(interface as pl_sock_interfaces)
+declare sub dhcp_new_xid(interface as pl_sock_interfaces)
+declare function dhcp_valid_interface(interface as pl_sock_interfaces) as no_yes
+declare sub send_dhcp(byref obtained_ip as string(16),interface as pl_sock_interfaces)
+declare sub dhcp_check_if_all_finished()
+declare function discard_sockets(interface as pl_sock_interfaces) as no_yes
+declare sub dhcp_init()
+declare sub dhcp_debug_print_status(interface as pl_sock_interfaces,status as en_dhcp_status_codes)
+declare sub dhcp_debugprint(interface as pl_sock_interfaces,byref print_data as string)
+
+'------------------------------------------------------------------------------
+'Shared state
+dim dhcp_sock as byte
+dim dhcp_owner as byte				'index of the interface currently holding the socket, or DHCP_NO_OWNER
+dim dhcp_rr_cursor as byte			'rotating scan start, for fairness
+dim dhcp_settle_ctr as byte			'ticks spent waiting for the socket to transition
+dim dhcp_release_pending as no_yes	'YES if a buffer release is waiting for the socket to close
+dim dhcp_init_flag as word
+dim dhcp_reentry_guard as no_yes	'YES while the library is inside its own state machine
+
+'Transaction-scoped state. Only one transaction is ever in flight (see the
+'concurrency note above), so these do not need to be per-interface.
+dim dhcp_netmask as string(16)
+dim dhcp_gateway as string(16)
+dim dhcp_lease_time as dword		'option 51, the true lease duration
+dim dhcp_t1 as dword				'option 58, renewal time
+dim dhcp_t2 as dword				'option 59, rebinding time
+
+'Per-interface state, indexed directly by the pl_sock_interfaces value.
+dim dhcp_phase(DHCP_MAX_INTERFACES) as en_dhcp_phases
+dim dhcp_lease_state(DHCP_MAX_INTERFACES) as en_dhcp_lease_states
+'T2 and expiry are absolute clocks that run on every tick for as long as we hold
+'a lease, independently of dhcp_timer (which schedules the next message). Without
+'them a renewal that simply goes unanswered would retry forever and the device
+'would keep using an address the server may have already reassigned.
+dim dhcp_t2_timer(DHCP_MAX_INTERFACES) as dword
+dim dhcp_expiry_timer(DHCP_MAX_INTERFACES) as dword
+dim dhcp_obtained_ip(DHCP_MAX_INTERFACES) as string(16)
+dim dhcp_server_ip(DHCP_MAX_INTERFACES) as string(16)
+dim dhcp_xid(DHCP_MAX_INTERFACES) as string(4)	'transaction ID, regenerated per transaction
+dim dhcp_timer(DHCP_MAX_INTERFACES) as dword
+dim dhcp_retry_ctr(DHCP_MAX_INTERFACES) as byte
+#if DHCP_MAX_HOST_NAME_LEN
+	dim dhcp_host_name(DHCP_MAX_INTERFACES) as string(DHCP_MAX_HOST_NAME_LEN)
+#endif
+dim dhcp_ignore_link_disconnects(DHCP_MAX_INTERFACES) as no_yes
+#if DHCP_DEBUG_PRINT
+	dim dhcp_media_linked(DHCP_MAX_INTERFACES) as no_yes
+#endif
+#if WLN_AVAILABLE
+	dim dhcp_wln_exchange_delay as byte
+#endif
+
+'==============================================================================
+public function dhcp_get_info(info_element as dhcp_info_elements, byref extra_data as string) as string
+'Returns library-specific information for the requested info element
+
+	dhcp_get_info=""
+	select case info_element
+	case DHCP_INFO_ELEMENT_REQUIRED_BUFFERS:
+		dhcp_get_info=str(DHCP_SOCK_BUFF_PAGES*2)
+
+	end select
+end function
+
+'------------------------------------------------------------------------------
+function dhcp_valid_interface(interface as pl_sock_interfaces) as no_yes
+'Returns YES if this build serves the specified interface.
+
+	dhcp_valid_interface=NO
+
+	if interface>=DHCP_MAX_INTERFACES then
+		exit function
+	end if
+
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			dhcp_valid_interface=YES
+			exit function
+		end if
+	#endif
+
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+			dhcp_valid_interface=YES
+			exit function
+		end if
+	#endif
+end function
+
+'--------------------------------------------------------------------
+public function dhcp_start(interface as pl_sock_interfaces, byref requested_ip as string, byref host_name as string) as en_dhcp_status_codes
+'API procedure, starts DHCP client on the specified network interface.
+
+	if dhcp_init_flag<>DHCP_INIT_SIGNATURE then
+		dhcp_init()
+		dhcp_init_flag=DHCP_INIT_SIGNATURE
+	end if
+
+	dhcp_start=DHCP_STATUS_OK
+
+	#if DHCP_DEBUG_PRINT
+		dhcp_debugprint(interface,"---START---")
+	#endif
+
+	'we only need to obtain a socket once
+	if dhcp_sock>=sock.numofsock then
+		dhcp_sock=sock_get(DHCP_SOCK_GET_SIGNATURE)
+	end if
+
+	if dhcp_sock>=sock.numofsock then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debug_print_status(interface,DHCP_STATUS_OUT_OF_SOCKETS)
+			dhcp_debugprint(interface,"---FAILURE---")
+		#endif
+		dhcp_start=DHCP_STATUS_OUT_OF_SOCKETS
+		exit function
+	end if
+
+	if dhcp_valid_interface(interface)=NO then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debug_print_status(interface,DHCP_STATUS_INVALID_INTERFACE)
+			dhcp_debugprint(interface,"---FAILURE---")
+		#endif
+		dhcp_start=DHCP_STATUS_INVALID_INTERFACE
+		exit function 'invalid interface specified
+	end if
+
+	'Reject a start on an interface that is already running BEFORE touching any
+	'state. Writing the arguments first would corrupt the address a transaction
+	'in flight is validating its ACK against.
+	if dhcp_phase(interface)<>DHCP_PHASE_OFF then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"Already started -- arguments ignored")
+		#endif
+		dhcp_start=DHCP_STATUS_ALREADY_STARTED
+		exit function
+	end if
+
+	if len(ddval(requested_ip))=4 then
+		dhcp_obtained_ip(interface)=requested_ip
+	else
+		dhcp_obtained_ip(interface)=""
+	end if
+
+	#if DHCP_MAX_HOST_NAME_LEN
+		dhcp_host_name(interface)=host_name
+	#endif
+	dhcp_server_ip(interface)=""
+	dhcp_new_xid(interface)
+	dhcp_lease_state(interface)=DHCP_LEASE_NONE
+	dhcp_t2_timer(interface)=0
+	dhcp_expiry_timer(interface)=0
+	dhcp_timer(interface)=1
+	dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+	dhcp_phase(interface)=DHCP_PHASE_DISCOVER
+end function
+
+'------------------------------------------------------------------------------
+public function dhcp_stop(interface as pl_sock_interfaces) as en_dhcp_status_codes
+'API procedure, stops DHCP client on the specified network interface.
+
+	if dhcp_init_flag<>DHCP_INIT_SIGNATURE then
+		dhcp_init()
+		dhcp_init_flag=DHCP_INIT_SIGNATURE
+	end if
+
+	dhcp_stop=DHCP_STATUS_OK
+
+	#if DHCP_DEBUG_PRINT
+		dhcp_debugprint(interface,"---STOP---")
+	#endif
+
+	if dhcp_valid_interface(interface)=NO then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debug_print_status(interface,DHCP_STATUS_INVALID_INTERFACE)
+			dhcp_debugprint(interface,"Did not stop")
+		#endif
+		dhcp_stop=DHCP_STATUS_INVALID_INTERFACE
+		exit function 'invalid interface specified
+	end if
+
+	'Release the socket and the buffer pages if this interface was holding them.
+	'Failing to do so latches the owner permanently and blocks every other
+	'interface, and leaks DHCP_SOCK_BUFF_PAGES*2 pages for the life of the app.
+	dhcp_release_socket(interface)
+	dhcp_timer(interface)=0
+	dhcp_phase(interface)=DHCP_PHASE_OFF
+	dhcp_check_if_all_finished()
+end function
+
+'------------------------------------------------------------------------------
+public sub dhcp_set_link_disconnect_behavior(interface as pl_sock_interfaces, behavior as no_yes)
+'API procedure, sets the behavior in case a network interface becomes disconnected
+'(Ethernet cable unplugged or Wi-Fi disassociated). Behavior=NO means that when the link is
+'reestablished the DHCP will be repeated for this interface. YES means that reestablishing the link
+'will not lead to the DHCP restart.
+
+	if dhcp_valid_interface(interface)=NO then
+		exit sub
+	end if
+	dhcp_ignore_link_disconnects(interface)=behavior
+end sub
+
+'------------------------------------------------------------------------------
+public sub dhcp_proc_timer()
+'Event procedure, call it from the on_sys_timer() event handler.
+'
+'Every interface is serviced on every call -- inactive ones return immediately.
+'The scan start rotates so that a busy interface cannot monopolise the socket.
+'Because the timers are plain countdowns, servicing all interfaces per tick is
+'what makes the constants in dhcp.tbh mean what they say.
+
+	dim i as byte
+	dim f as byte
+
+	if dhcp_init_flag<>DHCP_INIT_SIGNATURE then
+		exit sub
+	end if
+
+	'Refuse to run inside ourselves. The state machine invokes application
+	'callbacks, and if one of those calls back into this procedure the interface
+	'being advanced would be advanced twice from inconsistent state.
+	if dhcp_reentry_guard=YES then
+		exit sub
+	end if
+	dhcp_reentry_guard=YES
+
+	sock.num=dhcp_sock
+
+	for i=0 to DHCP_MAX_INTERFACES-1
+		f=dhcp_rr_cursor+i
+		if f>=DHCP_MAX_INTERFACES then
+			f=f-DHCP_MAX_INTERFACES
+		end if
+		dhcp_proc_one_interface(f)
+	next i
+
+	dhcp_rr_cursor=dhcp_rr_cursor+1
+	if dhcp_rr_cursor>=DHCP_MAX_INTERFACES then
+		dhcp_rr_cursor=0
+	end if
+
+	'A buffer release that could not complete because the socket was still
+	'closing retries here. The flag is NO almost all of the time, so this costs
+	'one comparison per tick.
+	if dhcp_release_pending=YES then
+		dhcp_check_if_all_finished()
+	end if
+
+	dhcp_reentry_guard=NO
+end sub
+
+'------------------------------------------------------------------------------
+sub dhcp_proc_one_interface(interface as pl_sock_interfaces)
+'Advances the state machine of a single interface by one tick.
+
+	dim open_result as en_dhcp_open_result
+
+	'Slot 0 (PL_SOCK_INTERFACE_NULL) and any spare slots are permanently OFF,
+	'so this one test retires them without any special casing.
+	if dhcp_phase(interface)=DHCP_PHASE_OFF then
+		exit sub
+	end if
+
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			if net.linkstate=PL_NET_LINKSTAT_NOLINK then
+				if dhcp_ignore_link_disconnects(interface)<>NO then exit sub
+
+				'Hand the socket back before parking. Otherwise an interface whose
+				'link drops mid-transaction latches the owner and every other
+				'interface waits forever.
+				dhcp_release_socket(interface)
+				dhcp_phase(interface)=DHCP_PHASE_IDLE
+				dhcp_lease_state(interface)=DHCP_LEASE_NONE
+				dhcp_t2_timer(interface)=0
+				dhcp_expiry_timer(interface)=0
+				dhcp_timer(interface)=1
+				dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+				#if DHCP_DEBUG_PRINT
+					dhcp_media_linked(interface)=NO
+				#endif
+				exit sub
+			else
+				#if DHCP_DEBUG_PRINT
+					if dhcp_media_linked(interface)=NO then
+						dhcp_debugprint(interface,"Ethernet cable plugged in -- DHCP (re)started")
+					end if
+					dhcp_media_linked(interface)=YES
+				#endif
+			end if
+		end if
+	#endif
+
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+#if PLATFORM_ID = WM2000
+			'wln.associationstate really is the platform property, so this
+			'comparison against PL_WLN_* is correct.
+			if wln.associationstate=PL_WLN_NOT_ASSOCIATED then
+#else
+			'wln_check_association() returns pl_wln_check_association_retval
+			'(NO / YES / INPROG), not the platform's pl_wln_association_states.
+			'Only YES means the link can carry a frame: INPROG covers the WPA
+			'handshake, during which a transmission would be lost.
+			if wln_check_association()<>WLN_ASSOCIATION_RETVAL_YES then
+#endif
+				if dhcp_ignore_link_disconnects(interface)<>NO then exit sub
+
+				dhcp_release_socket(interface)
+				dhcp_wln_exchange_delay=DHCP_WLN_EXCHANGE_DELAY_CONST
+				dhcp_phase(interface)=DHCP_PHASE_IDLE
+				dhcp_lease_state(interface)=DHCP_LEASE_NONE
+				dhcp_t2_timer(interface)=0
+				dhcp_expiry_timer(interface)=0
+				dhcp_timer(interface)=1
+				dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+				#if DHCP_DEBUG_PRINT
+					dhcp_media_linked(interface)=NO
+				#endif
+				exit sub
+			else
+				if dhcp_wln_exchange_delay>0 then
+					dhcp_wln_exchange_delay=dhcp_wln_exchange_delay-1
+					exit sub
+				end if
+
+				#if DHCP_DEBUG_PRINT
+					if dhcp_media_linked(interface)=NO then
+						dhcp_debugprint(interface,"Wi-Fi interface associated with the AP -- DHCP (re)started")
+					end if
+					dhcp_media_linked(interface)=YES
+				#endif
+			end if
+		end if
+	#endif
+
+	'--------------------------------------------------------------------------
+	'Lease clocks. These run on EVERY tick while an address is held, and must be
+	'decremented before the action timer below, which exits early on most ticks.
+	'--------------------------------------------------------------------------
+	if dhcp_lease_state(interface)<>DHCP_LEASE_NONE then
+		if dhcp_t2_timer(interface)>0 then
+			dhcp_t2_timer(interface)=dhcp_t2_timer(interface)-1
+		end if
+		if dhcp_expiry_timer(interface)>0 then
+			dhcp_expiry_timer(interface)=dhcp_expiry_timer(interface)-1
+		end if
+
+		'Lease expired. RFC 2131 4.4.5 requires the client to stop using the
+		'address and return to INIT. Clearing the lease state sends the IDLE
+		'dispatch down the DISCOVER path, and dhcp_sock_open() will then zero the
+		'interface IP via callback_dhcp_pre_clear_ip().
+		if dhcp_expiry_timer(interface)=0 then
+			#if DHCP_DEBUG_PRINT
+				dhcp_debugprint(interface,"Lease EXPIRED -- surrendering the address, restarting from DISCOVER")
+			#endif
+			dhcp_release_socket(interface)
+			dhcp_lease_state(interface)=DHCP_LEASE_NONE
+			dhcp_obtained_ip(interface)=""
+			dhcp_server_ip(interface)=""
+			dhcp_t2_timer(interface)=0
+			dhcp_phase(interface)=DHCP_PHASE_IDLE
+			dhcp_timer(interface)=1
+			dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+			exit sub
+		end if
+
+		'T2 reached while still trying to renew: give up on the original server
+		'and rebind by broadcast, so any server on the subnet may answer.
+		if dhcp_lease_state(interface)=DHCP_LEASE_RENEWING and dhcp_t2_timer(interface)=0 then
+			#if DHCP_DEBUG_PRINT
+				dhcp_debugprint(interface,"T2 reached -- switching from RENEWING to REBINDING (broadcast)")
+			#endif
+			dhcp_release_socket(interface)
+			dhcp_lease_state(interface)=DHCP_LEASE_REBINDING
+			dhcp_new_xid(interface)
+			dhcp_phase(interface)=DHCP_PHASE_IDLE
+			dhcp_timer(interface)=1
+			dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+			exit sub
+		end if
+	end if
+
+	'A timer of 0 means disabled.
+	if dhcp_timer(interface)=0 then
+		exit sub
+	else
+		dhcp_timer(interface)=dhcp_timer(interface)-1
+		if dhcp_timer(interface)>0 then
+			exit sub
+		end if
+	end if
+
+	'Only one interface may drive the shared socket at a time. If somebody else
+	'holds it, come back next tick.
+	if dhcp_owner<>DHCP_NO_OWNER and dhcp_owner<>interface then
+		dhcp_timer(interface)=1
+		exit sub
+	end if
+
+	select case dhcp_phase(interface)
+
+	case DHCP_PHASE_IDLE:
+		'Both branches below begin a NEW transaction, so each gets a fresh
+		'transaction ID. The REQUEST that follows an OFFER is part of the same
+		'transaction and deliberately reuses the ID already stored.
+		if dhcp_lease_state(interface)=DHCP_LEASE_NONE then
+			dhcp_new_xid(interface)
+			dhcp_phase(interface)=DHCP_PHASE_DISCOVER
+			goto label1
+		else
+			'BOUND means T1 has just come round, so this is the start of a new
+			'RENEWING exchange and gets a fresh transaction ID. If we are already
+			'RENEWING or REBINDING this is a retransmission, which per RFC 2131
+			'4.4.1 must reuse the existing ID.
+			if dhcp_lease_state(interface)=DHCP_LEASE_BOUND then
+				dhcp_lease_state(interface)=DHCP_LEASE_RENEWING
+				dhcp_new_xid(interface)
+				#if DHCP_DEBUG_PRINT
+					dhcp_debugprint(interface,"T1 reached -- RENEWING (unicast to the lease server)")
+				#endif
+			end if
+			dhcp_phase(interface)=DHCP_PHASE_REQUEST
+			goto label2
+		end if
+
+	case DHCP_PHASE_DISCOVER:
+label1:	open_result=dhcp_sock_open(interface,DHCP_PHASE_DISCOVER)
+		if open_result=DHCP_OPEN_FAILED then
+			dhcp_error(interface)
+			exit sub
+		end if
+		if open_result=DHCP_OPEN_PENDING then
+			'Socket still settling. Come back next tick; the phase is unchanged
+			'so we re-enter here, and no retry attempt is consumed.
+			dhcp_timer(interface)=1
+			exit sub
+		end if
+		'dhcp_sock_open() runs callback_dhcp_pre_clear_ip() and
+		'callback_dhcp_pre_buffrq(), either of which may have called dhcp_stop()
+		'on this interface. If the phase no longer matches, the application has
+		'changed its mind and this exchange must be abandoned.
+		if dhcp_phase(interface)<>DHCP_PHASE_DISCOVER then
+			dhcp_release_socket(interface)
+			exit sub
+		end if
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"TX discovery message")
+		#endif
+		'Drop anything stale sitting in the receive buffer before we start a
+		'new transaction, so a late reply from a previous attempt cannot be
+		'mistaken for the answer to this one.
+		sock.rxclear
+		send_dhcp(dhcp_obtained_ip(interface),interface)
+		dhcp_phase(interface)=DHCP_PHASE_DISCOVER_REPLY
+		dhcp_timer(interface)=DHCP_WAIT_TIME*DHCP_TICKS_PER_SEC
+		exit sub
+
+	case DHCP_PHASE_DISCOVER_REPLY:
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"ERROR: Timeout waiting for offer message")
+		#endif
+		dhcp_error(interface)
+		exit sub
+
+	case DHCP_PHASE_REQUEST:
+label2:	open_result=dhcp_sock_open(interface,DHCP_PHASE_REQUEST)
+		if open_result=DHCP_OPEN_FAILED then
+			dhcp_error(interface)
+			exit sub
+		end if
+		if open_result=DHCP_OPEN_PENDING then
+			dhcp_timer(interface)=1
+			exit sub
+		end if
+		'See the note in the DISCOVER case above.
+		if dhcp_phase(interface)<>DHCP_PHASE_REQUEST then
+			dhcp_release_socket(interface)
+			exit sub
+		end if
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"TX request message")
+		#endif
+		sock.rxclear
+		send_dhcp(dhcp_obtained_ip(interface),interface)
+		dhcp_phase(interface)=DHCP_PHASE_REQUEST_REPLY
+		dhcp_timer(interface)=DHCP_WAIT_TIME*DHCP_TICKS_PER_SEC
+		exit sub
+
+	case DHCP_PHASE_REQUEST_REPLY:
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"ERROR: Timeout waiting for confirmation message")
+		#endif
+		dhcp_error(interface)
+		exit sub
+
+	end select
+end sub
+
+'------------------------------------------------------------------------------
+public sub dhcp_proc_data()
+'Event procedure, call it from the on_sock_data_arrival() event handler.
+
+	dim interface as pl_sock_interfaces
+	dim s as string
+	dim s2 as string(32)
+	dim x,f as byte
+	dim message_type as byte
+	dim msg_type_found as no_yes
+	dim end_seen as no_yes
+	dim was_renew as no_yes
+	dim renew_sec as dword
+	dim t2_sec as dword
+	dim lease_sec as dword
+	dim mac as string(6)
+
+	interface=PL_SOCK_INTERFACE_NULL
+
+	for f=0 to DHCP_MAX_INTERFACES-1
+		if dhcp_init_flag=DHCP_INIT_SIGNATURE and dhcp_phase(f)<>DHCP_PHASE_OFF then
+			goto dhcp_is_active
+		end if
+	next f
+	exit sub
+
+dhcp_is_active:
+	if sock.num<>dhcp_sock then
+		exit sub
+	end if
+
+	'Same reasoning as in dhcp_proc_timer(): callback_dhcp_ok() is application
+	'code, and it must not be able to re-enter the packet decoder.
+	if dhcp_reentry_guard=YES then
+		exit sub
+	end if
+	dhcp_reentry_guard=YES
+
+	s=sock.getdata(236) 'read all the data up to a magic cookie
+
+	'verify opcode: must be "reply" (2)
+	'verify hardware type: must be "ethernet" (1)
+	'verify hardware address length: must be (6)
+	if ddstr(mid(s,1,3))<>"2.1.6" then
+		goto dhcp_proc_data_error
+	end if
+
+	'Work out which interface this reply belongs to by matching the transaction ID
+	'against the ones we currently have outstanding. Because each transaction gets
+	'its own random ID, this does not depend on the interfaces having distinguishable
+	'MAC addresses.
+	for f=0 to DHCP_MAX_INTERFACES-1
+		if dhcp_phase(f)<>DHCP_PHASE_OFF and dhcp_xid(f)=mid(s,5,4) then
+			interface=f
+			goto decode_packet
+		end if
+	next f
+
+	goto dhcp_proc_data_error
+
+decode_packet:
+	'Our own MAC on the matched interface. The server must echo it back in chaddr,
+	'which is verified further down and is what makes an ID collision harmless.
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			mac=ddval(net.mac)
+		end if
+	#endif
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+			mac=ddval(wln.mac)
+		end if
+	#endif
+
+	'branch according to the phase
+	select case dhcp_phase(interface)
+	case DHCP_PHASE_DISCOVER_REPLY:
+		'make sure IP-address being offered is valid
+		'first number cannot exceed 223
+		if asc(mid(s,17,1))>223 then
+			goto dhcp_proc_data_error
+		end if
+
+		'last number cannot be 0 or 255
+		x=asc(mid(s,20,1))
+		if x=0 or x=255 then
+			goto dhcp_proc_data_error
+		end if
+
+		'IP-address being offered is correct- extract it!
+		dhcp_obtained_ip(interface)=ddstr(mid(s,17,4))
+
+	case DHCP_PHASE_REQUEST_REPLY:
+		'Make sure that the IP-address the DHCP supplied now (ACK) is the same as in OFFER message
+		'(or the same we've been using if we are extending the lease)
+		s2=ddstr(mid(s,17,4))
+		if dhcp_obtained_ip(interface)<>s2 then
+			goto dhcp_proc_data_error
+		end if
+
+	case else:
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"INFO: RX unexpected message (wasn't expecting anything at the moment)")
+		#endif
+		goto dhcp_proc_data_error
+
+	end select
+
+	'This part is common for all types of replies received from the DHCP server.
+	'Extract and verify our own MAC (must be returned by the server)
+	if mid(s,29,6)<>mac then
+			goto dhcp_proc_data_error
+	end if
+
+	'Read magic cookie and options
+	s=sock.getdata(255)
+
+	'Check magic cookie
+	if ddstr(mid(s,1,4))<>"99.130.83.99" then
+		goto dhcp_proc_data_error
+	end if
+
+	'Start from a clean slate for every packet. A conservative default lease is
+	'assumed rather than an effectively infinite one.
+	dhcp_lease_time=DHCP_DEFAULT_LEASE
+	dhcp_t1=0
+	dhcp_t2=0
+	dhcp_netmask=""
+	dhcp_gateway=""
+	msg_type_found=NO
+	end_seen=NO
+
+	'Look through options and extract the ones we need. Option 53 (message type)
+	'is the only one that is mandatory.
+	for f=5 to len(s)
+		select case asc(mid(s,f,1))
+		case 255: 'reached the end of all options
+			end_seen=YES
+			goto exit_options
+
+		case 0: 'this is a "padding"- just skip it
+			goto next_option
+
+		case 53: 'message type- make sure its length is 1
+			if asc(mid(s,f+1,1))<>1 then
+				goto dhcp_proc_data_error
+			end if
+			'now get the message type and see if it is correct
+			message_type=asc(mid(s,f+2,1))
+			msg_type_found=YES
+			select case dhcp_phase(interface)
+			case DHCP_PHASE_DISCOVER_REPLY:
+				if message_type<>2 then
+					goto dhcp_proc_data_error
+				end if
+
+			case DHCP_PHASE_REQUEST_REPLY:
+				'A NAK means the server has rejected the address we asked for.
+				'It must be handled explicitly: treating it as a generic decode
+				'error would leave the lease state at RENEWING/REBINDING, and the
+				'IDLE dispatch would re-REQUEST the rejected address forever.
+				if message_type=6 then
+					goto dhcp_proc_data_nak
+				end if
+				if message_type<>5 then
+					goto dhcp_proc_data_error
+				end if
+
+			case else:
+
+			end select
+			f=f+2
+
+		case 1: 'netmask option!- make sure its length is 4
+			if asc(mid(s,f+1,1))<>4 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_netmask=ddstr(mid(s,f+2,4))
+			f=f+5
+
+		case 3: 'default gateway IP option!- there can be N gateways, length must be 4*n
+			x=asc(mid(s,f+1,1))
+			if x<4 or x-(x/4)*4<>0 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_gateway=ddstr(mid(s,f+2,4))
+			f=f+1+x
+
+		case 51: 'IP address lease time
+			if asc(mid(s,f+1,1))<>4 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_lease_time=asc(mid(s,f+2,1))*16777216+asc(mid(s,f+3,1))*65536+asc(mid(s,f+4,1))*256+asc(mid(s,f+5,1))
+			f=f+5
+
+		case 58: 'T1, renewal time (RFC 2132 -- option 58 is T1, NOT 59)
+			if asc(mid(s,f+1,1))<>4 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_t1=asc(mid(s,f+2,1))*16777216+asc(mid(s,f+3,1))*65536+asc(mid(s,f+4,1))*256+asc(mid(s,f+5,1))
+			f=f+5
+
+		case 59: 'T2, rebinding time. Parsed and kept for a future rebinding state.
+			if asc(mid(s,f+1,1))<>4 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_t2=asc(mid(s,f+2,1))*16777216+asc(mid(s,f+3,1))*65536+asc(mid(s,f+4,1))*256+asc(mid(s,f+5,1))
+			f=f+5
+
+		case 54: 'server identifier option
+			if asc(mid(s,f+1,1))<>4 then
+				goto dhcp_proc_data_error
+			end if
+			dhcp_server_ip(interface)=ddstr(mid(s,f+2,4))
+			f=f+5
+
+		case else: 'some other option: just skip it
+			x=asc(mid(s,f+1,1))
+			f=f+x+1
+
+		end select
+next_option:
+	next f
+
+exit_options:
+	'Option 53 is mandatory (RFC 2131). Without it we have no idea what kind of
+	'message this is, so accepting the packet would mean trusting an unverified
+	'reply -- and in the REQUEST_REPLY phase it would also mean a NAK slipping
+	'through unnoticed.
+	if msg_type_found=NO then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"ERROR: reply carries no message type option (53)")
+		#endif
+		goto dhcp_proc_data_error
+	end if
+
+	'A string cannot hold more than 255 bytes, so the options read above is a
+	'fixed window. Filling that window without reaching the end-of-options marker
+	'means the block was truncated, so any option we did not reach is missing and
+	'the packet cannot be trusted. A SHORT read with no marker is merely a sloppy
+	'server, and is tolerated.
+	if end_seen=NO and len(s)>=255 then
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"ERROR: options block truncated at the 255-byte read window")
+		#endif
+		goto dhcp_proc_data_error
+	end if
+
+	'packet decoded successfully -- restore the full retry budget, so a rocky
+	'acquisition does not permanently shrink the allowance for later renewals.
+	dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+
+	select case dhcp_phase(interface)
+	case DHCP_PHASE_DISCOVER_REPLY:
+		'An OFFER must carry option 54. Without it the REQUEST cannot name the
+		'server it is addressing.
+		if dhcp_server_ip(interface)="" then
+			#if DHCP_DEBUG_PRINT
+				dhcp_debugprint(interface,"ERROR: offer carries no server identifier option (54)")
+			#endif
+			goto dhcp_proc_data_error
+		end if
+
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"RX offer message")
+		#endif
+		dhcp_phase(interface)=DHCP_PHASE_REQUEST
+		dhcp_timer(interface)=1
+		dhcp_sock_close()
+
+	case DHCP_PHASE_REQUEST_REPLY:
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"RX confirmation message")
+		#endif
+		'DHCP interaction completed successfully
+		dhcp_phase(interface)=DHCP_PHASE_IDLE
+
+		'----------------------------------------------------------------------
+		'Lease timing, per RFC 2131 4.4.1. T1 defaults to half the lease and T2
+		'to seven eighths of it when the server supplies no option 58 / 59.
+		'----------------------------------------------------------------------
+		lease_sec=dhcp_lease_time
+		if lease_sec>DHCP_MAX_RENEW_SEC then
+			lease_sec=DHCP_MAX_RENEW_SEC
+		end if
+
+		'Server-supplied values are only honoured if they are sane relative to
+		'the lease, otherwise fall back to the RFC defaults.
+		if dhcp_t1>0 and dhcp_t1<lease_sec then
+			renew_sec=dhcp_t1
+		else
+			renew_sec=lease_sec/2
+		end if
+		if dhcp_t2>0 and dhcp_t2<lease_sec and dhcp_t2>renew_sec then
+			t2_sec=dhcp_t2
+		else
+			t2_sec=lease_sec-(lease_sec/8)
+		end if
+
+		'Enforce T1 < T2 < expiry with a usable gap at each step. A zero-tick
+		'timer would read as "disabled", so nothing may collapse to zero.
+		if renew_sec<DHCP_MIN_RENEW_SEC then
+			renew_sec=DHCP_MIN_RENEW_SEC
+		end if
+		if t2_sec<=renew_sec then
+			t2_sec=renew_sec+DHCP_MIN_RENEW_SEC
+		end if
+		if lease_sec<=t2_sec then
+			lease_sec=t2_sec+DHCP_MIN_RENEW_SEC
+		end if
+
+		dhcp_timer(interface)=renew_sec*DHCP_TICKS_PER_SEC
+		dhcp_t2_timer(interface)=t2_sec*DHCP_TICKS_PER_SEC
+		dhcp_expiry_timer(interface)=lease_sec*DHCP_TICKS_PER_SEC
+
+		dhcp_sock_close()
+
+		'Capture whether this was a renewal BEFORE updating the flag. The flag is
+		'set ahead of the callback rather than after it, because the callback is
+		'application code that may re-enter this library -- but the callback still
+		'has to be told what this exchange actually was.
+		if dhcp_lease_state(interface)=DHCP_LEASE_NONE then
+			was_renew=NO
+		else
+			was_renew=YES
+		end if
+		dhcp_lease_state(interface)=DHCP_LEASE_BOUND
+
+		dhcp_check_if_all_finished()
+		#if DHCP_DEBUG_PRINT
+			dhcp_debugprint(interface,"---OK(ip: "+dhcp_obtained_ip(interface)+", gateway: "+dhcp_gateway+", netmask: "+dhcp_netmask+", lease: "+lstr(dhcp_lease_time)+" sec., T1 "+lstr(renew_sec)+"s, T2 "+lstr(t2_sec)+"s, expiry "+lstr(lease_sec)+"s)---")
+		#endif
+		callback_dhcp_ok(was_renew,interface,dhcp_obtained_ip(interface),dhcp_gateway,dhcp_netmask,dhcp_lease_time)
+		sock.num=dhcp_sock
+	end select
+	dhcp_reentry_guard=NO
+	exit sub
+
+dhcp_proc_data_nak:
+	'DHCPNAK. Give up the address entirely and restart from DISCOVER.
+	dhcp_release_socket(interface)
+	dhcp_lease_state(interface)=DHCP_LEASE_NONE
+	dhcp_t2_timer(interface)=0
+	dhcp_expiry_timer(interface)=0
+	dhcp_obtained_ip(interface)=""
+	dhcp_server_ip(interface)=""
+	dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+	dhcp_phase(interface)=DHCP_PHASE_IDLE
+	dhcp_timer(interface)=1
+	#if DHCP_DEBUG_PRINT
+		dhcp_debugprint(interface,"RX NAK -- address rejected, restarting from DISCOVER")
+	#endif
+	dhcp_reentry_guard=NO
+	exit sub
+
+dhcp_proc_data_error:
+	#if DHCP_DEBUG_PRINT
+		dhcp_debugprint(interface,"INFO: RX unexpected, invalid, or unrelated message (it was discarded)")
+	#endif
+	'Drain whatever is left of this datagram. Anything we leave behind can
+	're-trigger the arrival event and be misread as the head of a new packet.
+	sock.rxclear
+	'Every goto in this procedure lands here, so this one assignment covers all
+	'of the failure exits.
+	dhcp_reentry_guard=NO
+end sub
+
+'------------------------------------------------------------------------------
+sub dhcp_error(interface as pl_sock_interfaces)
+	'DHCP error
+	'Re-select our own socket first: we may have arrived here straight after
+	'dhcp_sock_open() ran application callbacks that moved sock.num.
+	sock.num=dhcp_sock
+	dhcp_sock_close()
+
+	if dhcp_phase(interface)<>DHCP_PHASE_OFF then
+		dhcp_phase(interface)=DHCP_PHASE_IDLE
+		dhcp_check_if_all_finished()
+	end if
+
+	if dhcp_retry_ctr(interface)>0 then
+		dhcp_timer(interface)=(((asc(random(1))) mod DHCP_MAX_RETRY_DELAY)+1)*DHCP_TICKS_PER_SEC
+		dhcp_retry_ctr(interface)=dhcp_retry_ctr(interface)-1
+	else
+		dhcp_retry_ctr(interface)=DHCP_MAX_RETRIES
+		dhcp_timer(interface)=DHCP_POST_FAIL_DELAY*DHCP_TICKS_PER_SEC
+		#if DHCP_DEBUG_PRINT
+			dhcp_debug_print_status(interface,DHCP_STATUS_FAILURE)
+		#endif
+		callback_dhcp_failure(interface,DHCP_STATUS_FAILURE)
+		sock.num=dhcp_sock
+	end if
+end sub
+
+'------------------------------------------------------------------------------
+function dhcp_sock_open(interface as pl_sock_interfaces, phase as en_dhcp_phases) as en_dhcp_open_result
+
+	dhcp_owner=interface
+	sock.num=dhcp_sock
+
+	'A socket that is neither closed nor established is still transitioning from
+	'a previous exchange. Defer rather than wait for it.
+	if sock.statesimple<>PL_SSTS_CLOSED and sock.statesimple<>PL_SSTS_EST then
+		goto dhcp_defer_open
+	end if
+
+	'for DHCP DISCOVER, we need to have the IP address at 0.0.0.0
+	if phase=DHCP_PHASE_DISCOVER then
+		#if NET_AVAILABLE
+			if interface=PL_SOCK_INTERFACE_NET then
+				if net.ip<>"0.0.0.0" then
+					callback_dhcp_pre_clear_ip(PL_SOCK_INTERFACE_NET)
+					sock.num=dhcp_sock
+					sock.inconenabledmaster=NO
+					if discard_sockets(PL_SOCK_INTERFACE_NET)=NO then
+						'Sockets have not finished closing. The IP must not be
+						'changed until they have, so restore incoming connections
+						'and come back next tick.
+						sock.inconenabledmaster=YES
+						sock.num=dhcp_sock
+						goto dhcp_defer_open
+					end if
+					net.ip="0.0.0.0"
+					sock.inconenabledmaster=YES
+				end if
+			end if
+		#endif
+
+		#if WLN_AVAILABLE
+			if interface=PL_SOCK_INTERFACE_WLN then
+				if wln.ip<>"0.0.0.0" then
+					callback_dhcp_pre_clear_ip(PL_SOCK_INTERFACE_WLN)
+					sock.num=dhcp_sock
+					sock.inconenabledmaster=NO
+					if discard_sockets(PL_SOCK_INTERFACE_WLN)=NO then
+						sock.inconenabledmaster=YES
+						sock.num=dhcp_sock
+						goto dhcp_defer_open
+					end if
+					wln.ip="0.0.0.0"
+					sock.inconenabledmaster=YES
+				end if
+			end if
+		#endif
+	end if
+
+	'arrange buffer space
+	if sock.rxbuffsize<DHCP_MIN_BUFFER_SPACE or sock.txbuffsize<DHCP_MIN_BUFFER_SPACE then
+		sock.rxbuffrq(0)
+		sock.txbuffrq(0)
+		sys.buffalloc
+
+		'Ask the application to free the shortfall.
+		if sys.freebuffpages<DHCP_SOCK_BUFF_PAGES*2 then
+			callback_dhcp_pre_buffrq(DHCP_SOCK_BUFF_PAGES*2-sys.freebuffpages)
+			sock.num=dhcp_sock
+		end if
+
+		sock.rxbuffrq(DHCP_SOCK_BUFF_PAGES)
+		sock.txbuffrq(DHCP_SOCK_BUFF_PAGES)
+		sys.buffalloc
+		if sock.rxbuffsize<DHCP_MIN_BUFFER_SPACE or sock.txbuffsize<DHCP_MIN_BUFFER_SPACE then
+			#if DHCP_DEBUG_PRINT
+				dhcp_debug_print_status(interface,DHCP_STATUS_INSUFFICIENT_BUFFER_SPACE)
+			#endif
+			'Hand the socket back -- we never got as far as using it.
+			dhcp_settle_ctr=0
+			dhcp_owner=DHCP_NO_OWNER
+			dhcp_sock_open=DHCP_OPEN_FAILED
+			exit function
+		end if
+	end if
+
+	'Re-assert ownership. Everything above this point may have invoked an
+	'application callback, and if one of those called dhcp_stop() on this
+	'interface it will have cleared the owner via dhcp_sock_close() -- leaving us
+	'about to drive a socket that nothing claims. The caller re-checks the phase
+	'once we return, but the socket must not be left unowned in the meantime.
+	dhcp_owner=interface
+
+	'setup the socket itself
+	sock.allowedinterfaces="WLN,NET"
+	sock.protocol=PL_SOCK_PROTOCOL_UDP
+	sock.targetport=67
+	sock.outport=68
+	'RFC 2131 4.4.5: a RENEWING client unicasts to the server that granted the
+	'lease. REBINDING and initial acquisition broadcast, so that any server may
+	'answer. This is why a failed unicast renewal still recovers -- at T2 the
+	'state machine falls back to REBINDING and starts broadcasting.
+	if dhcp_lease_state(interface)=DHCP_LEASE_RENEWING and dhcp_server_ip(interface)<>"" then
+		sock.targetbcast=NO
+		sock.targetip=dhcp_server_ip(interface)
+	else
+		sock.targetbcast=YES
+	end if
+	sock.acceptbcast=YES
+	sock.connectiontout=600
+	sock.inconmode=PL_SOCK_INCONMODE_ANY_IP_ANY_PORT
+	sock.reconmode=PL_SOCK_RECONMODE_3
+
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			sock.targetinterface=PL_SOCK_INTERFACE_NET
+		end if
+	#endif
+
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+			sock.targetinterface=PL_SOCK_INTERFACE_WLN
+		end if
+	#endif
+
+	if sock.statesimple=PL_SSTS_CLOSED then
+		sock.connect
+		if sock.statesimple<>PL_SSTS_EST then
+			goto dhcp_defer_open
+		end if
+	end if
+
+	dhcp_settle_ctr=0
+	dhcp_sock_open=DHCP_OPEN_OK
+	exit function
+
+dhcp_defer_open:
+	'The socket is mid-transition. Report PENDING so the caller retries on the
+	'next tick, without consuming a retry attempt. dhcp_settle_ctr bounds how
+	'long that can go on for.
+	if dhcp_settle_ctr<DHCP_SOCK_SETTLE_TICKS then
+		dhcp_settle_ctr=dhcp_settle_ctr+1
+		dhcp_sock_open=DHCP_OPEN_PENDING
+		exit function
+	end if
+
+	'Out of patience. Force the socket down and fail the attempt, so the normal
+	'retry and backoff logic takes over.
+	#if DHCP_DEBUG_PRINT
+		dhcp_debugprint(interface,"ERROR: socket did not settle within "+str(DHCP_SOCK_SETTLE_TICKS)+" ticks")
+	#endif
+	dhcp_settle_ctr=0
+	sock.discard
+	dhcp_owner=DHCP_NO_OWNER
+	dhcp_sock_open=DHCP_OPEN_FAILED
+end function
+
+'------------------------------------------------------------------------------
+sub dhcp_sock_close()
+'Starts closing the shared socket and hands ownership back.
+'
+'Returns immediately. The socket may take a moment to reach PL_SSTS_CLOSED;
+'dhcp_sock_open() checks for that and defers, so there is no need to wait here.
+
+	sock.discard
+	dhcp_owner=DHCP_NO_OWNER
+end sub
+
+'------------------------------------------------------------------------------
+sub dhcp_new_xid(interface as pl_sock_interfaces)
+'Generates a fresh 4-byte transaction ID for a new exchange with a server.
+'
+'Called when starting an acquisition and when starting a lease renewal, but NOT
+'for the REQUEST that follows an OFFER -- that is the same transaction and must
+'carry the same ID.
+'
+'A random value also stops a delayed reply from an abandoned attempt being taken
+'as the answer to the current one, and it is what lets dhcp_proc_data() tell the
+'interfaces apart without depending on their MAC addresses differing.
+
+	dhcp_xid(interface)=random(4)
+end sub
+
+'------------------------------------------------------------------------------
+sub dhcp_release_socket(interface as pl_sock_interfaces)
+'Closes the socket only if this interface is the one holding it. Safe to call
+'from any exit path, including ones where somebody else owns the socket.
+
+	if dhcp_owner=interface then
+		sock.num=dhcp_sock
+		dhcp_sock_close()
+	end if
+end sub
+
+'------------------------------------------------------------------------------
+sub dhcp_check_if_all_finished()
+'Releases the socket buffer pages whenever no interface has an exchange in flight.
+'The pages are re-acquired by dhcp_sock_open() when the next discovery or renewal
+'begins, so they are only held while actually in use.
+'
+'The same rule applies to every interface. An interface counts as needing the
+'pages if:
+'
+'  - it is mid-exchange (any phase other than IDLE or OFF), or
+'  - it is between retries within a batch (retry counter below its maximum),
+'    since it will transmit again shortly and releasing would only churn.
+'
+'Everything else releases -- including an interface waiting for its medium to come
+'up, one waiting out a post-failure delay, and one simply holding a lease until
+'renewal time. None of those will transmit without first calling dhcp_sock_open(),
+'which re-acquires.
+
+	dim f as byte
+
+	for f=0 to DHCP_MAX_INTERFACES-1
+		if dhcp_phase(f)=DHCP_PHASE_OFF then
+			goto next_interface
+		end if
+		if dhcp_phase(f)<>DHCP_PHASE_IDLE then
+			goto dhcp_still_busy
+		end if
+		if dhcp_retry_ctr(f)<>DHCP_MAX_RETRIES then
+			goto dhcp_still_busy
+		end if
+next_interface:
+	next f
+
+	sock.num=dhcp_sock
+
+	'Buffer pages cannot be given up until the socket has finished closing, and
+	'dhcp_sock_close() does not wait for that. Ask to be called again on the next
+	'tick rather than blocking here.
+	if sock.statesimple<>PL_SSTS_CLOSED then
+		#if DHCP_DEBUG_PRINT
+			if dhcp_release_pending=NO then
+				sys.debugprint(DHCP_STAMP1+"lib"+DHCP_STAMP2+"buffer release deferred, socket still closing"+DHCP_CR_LF)
+			end if
+		#endif
+		dhcp_release_pending=YES
+		exit sub
+	end if
+
+	dhcp_release_pending=NO
+	sock.rxbuffrq(0)
+	sock.txbuffrq(0)
+	sys.buffalloc
+	#if DHCP_DEBUG_PRINT
+		sys.debugprint(DHCP_STAMP1+"lib"+DHCP_STAMP2+"buffer pages released, free="+str(sys.freebuffpages)+DHCP_CR_LF)
+	#endif
+	callback_dhcp_buff_released()
+	sock.num=dhcp_sock
+	exit sub
+
+dhcp_still_busy:
+	'An interface still needs the socket, so there is nothing to release and no
+	'reason to keep retrying.
+	dhcp_release_pending=NO
+end sub
+
+'------------------------------------------------------------------------------
+sub send_dhcp(byref obtained_ip as string(16), interface as pl_sock_interfaces)
+	dim s as string
+	dim mac as string(6)
+
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			mac=ddval(net.mac)
+		end if
+	#endif
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+			mac=ddval(wln.mac)
+		end if
+	#endif
+
+	'1.1.6.0- opcode=rq, hware type= Ethernet, hardware addr len= 6, hop count=0
+	s=ddval("1.1.6.0")
+
+	'transaction ID- randomly generated once per transaction (RFC 2131 4.1)
+	s=s+dhcp_xid(interface)
+
+	'0.0- number of seconds elapsed.
+	'Broadcast flag: set only while we have no usable address, because that is
+	'the case where the reply cannot be unicast back to us. Once an address is
+	'held (RENEWING or REBINDING) the flag is cleared -- RFC 2131 Table 4.
+	if dhcp_lease_state(interface)=DHCP_LEASE_NONE then
+		s=s+ddval("0.0.128.0")
+	else
+		s=s+ddval("0.0.0.0")
+	end if
+
+	'--------------------------------------------------------------------------
+	'PART 1 of 2 -- the address fields of the BOOTP fixed header.
+	'This select fills ciaddr, yiaddr, siaddr and giaddr (16 bytes). A second
+	'select further down builds the options. The two cannot be merged because
+	'the 236-byte fixed header has to be written to the socket in between.
+	'--------------------------------------------------------------------------
+	select case dhcp_phase(interface)
+	case DHCP_PHASE_DISCOVER:
+		'for DISCOVER message all fields until MAC-address are unused
+		'set client ip, your ip, server ip, gateway ip all to zeroes.
+		s=s+strgen(16,chr(0))
+
+	case DHCP_PHASE_REQUEST:
+		'ciaddr. RFC 2131 Table 4: zero while SELECTING (the address being asked
+		'for travels in option 50 instead), but set to the address we already
+		'hold when RENEWING or REBINDING.
+		if dhcp_lease_state(interface)=DHCP_LEASE_NONE then
+			s=s+strgen(4,chr(0))
+		else
+			s=s+ddval(obtained_ip)
+		end if
+
+		'yiaddr- always zero in a client request
+		s=s+strgen(4,chr(0))
+
+		'siaddr- zero is correct in a client request
+		s=s+strgen(4,chr(0))
+
+		'no need to set gateway IP
+		s=s+strgen(4,chr(0))
+
+	case else:
+	end select
+
+	s=s+mac 'client MAC
+
+	sock.setdata(s)
+
+	'now we just need 202 more bytes to complete the 236-byte fixed header
+	'(10 bytes of chaddr padding + 64 bytes sname + 128 bytes file)
+	s=strgen(202,chr(0))
+	sock.setdata(s)
+
+	'continue...
+	s=ddval("99.130.83.99") 'magic cookie
+
+	'--------------------------------------------------------------------------
+	'PART 2 of 2 -- the option block. Same phase variable as the select in part
+	'one; the phase cannot change in between, so both take the same branch.
+	'--------------------------------------------------------------------------
+	select case dhcp_phase(interface)
+	case DHCP_PHASE_DISCOVER:
+		'53.1.1- set message type to DISCOVER
+		s=s+ddval("53.1.1")
+
+		'116.1.1 - DHCP Auto Configuration
+		s=s+ddval("116.1.1")
+
+		'61.7 - Client Identifier
+		s=s+ddval("61.7.1.")+mac
+
+		'50.4- ask for a specific address, but only if we actually have one in
+		'mind. Option 50 is optional in a DISCOVER, and by this point the
+		'interface IP has already been cleared to 0.0.0.0 -- so there is nothing
+		'meaningful to fall back on, and asking for 0.0.0.0 would be worse than
+		'not asking at all.
+		if obtained_ip <> "" then
+			s=s+ddval("50.4."+obtained_ip)
+		end if
+
+		'51.4.255.255.255.255- suggest maximum lease time
+		s=s+ddval("51.4.255.255.255.255")
+
+		'12 - host name. Sent in the DISCOVER as well as the REQUEST, which is what
+		'ordinary clients do and what most servers use to register the name in DNS.
+		#if DHCP_MAX_HOST_NAME_LEN
+			if dhcp_host_name(interface)<>"" then
+				s=s+chr(12)+chr(len(dhcp_host_name(interface)))+dhcp_host_name(interface)
+			end if
+		#endif
+
+		'55 - parameter request list: netmask (1), router (3), lease time (51),
+		'T1 (58) and T2 (59). Options 51 and 54 are mandatory in a reply, but 58
+		'and 59 are optional and most servers supply them only when asked.
+		s=s+ddval("55.5.1.3.51.58.59")
+
+	case DHCP_PHASE_REQUEST:
+		'53.1.3- set message type to REQUEST
+		s=s+ddval("53.1.3")
+
+		'Our identifier
+		s=s+ddval("61.7.1")+mac
+
+		'Options 50 and 54 belong to a SELECTING request only. RFC 2131 Table 4
+		'says a RENEWING or REBINDING client MUST NOT send either: the address is
+		'already in ciaddr, and naming a specific server would defeat the point
+		'of rebinding.
+		if dhcp_lease_state(interface)=DHCP_LEASE_NONE then
+			'54.4- the DHCP server whose offer we are accepting
+			s=s+ddval("54.4")+ddval(dhcp_server_ip(interface))
+
+			'50.4- requested IP (the address that server offered us)
+			s=s+ddval("50.4")+ddval(obtained_ip)
+		end if
+
+		'12 - host name, if one was supplied to dhcp_start()
+		#if DHCP_MAX_HOST_NAME_LEN
+			if dhcp_host_name(interface)<>"" then
+				s=s+chr(12)+chr(len(dhcp_host_name(interface)))+dhcp_host_name(interface)
+			end if
+		#endif
+
+		'55 - parameter request list: netmask (1), router (3), lease time (51),
+		'T1 (58) and T2 (59). Options 51 and 54 are mandatory in a reply, but 58
+		'and 59 are optional and most servers supply them only when asked.
+		s=s+ddval("55.5.1.3.51.58.59")
+
+	case else:
+
+	end select
+
+	'end of all options and send!
+	'We pad the packet for compatibility to certain DHCP server that conforms to BOOTP packet size.
+	'Split across three calls because a single expression cannot exceed the
+	'255-byte string limit.
+	'
+	'NOTE on the ceiling: s itself cannot exceed 255 bytes, so 255-len(s) can never
+	'go negative. The real hazard is one step earlier -- if the options built above
+	'were ever to exceed 255 bytes, s would be silently truncated and the option
+	'block would go out malformed. With a 32-byte host name the worst case is about
+	'70 bytes, so there is ample headroom; keep DHCP_MAX_HOST_NAME_LEN below ~200.
+	sock.setdata(s+CHR(255))
+	sock.setdata(strgen(255-len(s),CHR(0)))
+	sock.setdata(strgen(64,CHR(0)))
+	sock.send
+end sub
+
+'--------------------------------------------------------------------
+function discard_sockets(interface as pl_sock_interfaces) as no_yes
+'Asks every socket on the given interface to go down, then reports whether they
+'are all actually closed. Returns NO if any are still shutting down, in which
+'case the caller should try again on the next tick.
+'
+'The interface IP cannot be changed while any socket on it is still open, which
+'is why the result has to be checked rather than assumed.
+
+	dim f,sock_bup as byte
+
+	sock_bup=sock.num
+
+	'First pass: initiate the shutdown.
+	for f=0 to sock.numofsock-1
+		sock.num=f
+		if sock.currentinterface=interface and sock.statesimple<>PL_SSTS_CLOSED then
+			sock.discard
+		end if
+	next f
+
+	'Second pass: see whether they have gone down yet. Usually they have, and
+	'this returns YES on the first call.
+	discard_sockets=YES
+	for f=0 to sock.numofsock-1
+		sock.num=f
+		if sock.currentinterface=interface and sock.statesimple<>PL_SSTS_CLOSED then
+			discard_sockets=NO
+		end if
+	next f
+
+	sock.num=sock_bup
+end function
+
+'----------------------------------------------------------------------------
+sub dhcp_init()
+	dim f as byte
+
+	dhcp_sock=255 'important!
+	dhcp_owner=DHCP_NO_OWNER
+	dhcp_rr_cursor=0
+	dhcp_settle_ctr=0
+	dhcp_release_pending=NO
+	dhcp_reentry_guard=NO
+
+	'Every slot starts OFF, including slot 0 (PL_SOCK_INTERFACE_NULL) and any
+	'spares. That is what lets the dispatch loop and dhcp_check_if_all_finished()
+	'walk the whole table without special-casing unused entries.
+	for f=0 to DHCP_MAX_INTERFACES-1
+		dhcp_phase(f)=DHCP_PHASE_OFF
+		dhcp_lease_state(f)=DHCP_LEASE_NONE
+		dhcp_t2_timer(f)=0
+		dhcp_expiry_timer(f)=0
+		dhcp_timer(f)=0
+		dhcp_retry_ctr(f)=DHCP_MAX_RETRIES
+		dhcp_obtained_ip(f)=""
+		dhcp_server_ip(f)=""
+		dhcp_xid(f)=""
+		#if DHCP_DEBUG_PRINT
+			dhcp_media_linked(f)=YES 'correct, it is YES
+		#endif
+		dhcp_ignore_link_disconnects(f)=NO
+	next f
+
+	dhcp_netmask=""
+	dhcp_gateway=""
+	dhcp_lease_time=0
+	dhcp_t1=0
+	dhcp_t2=0
+
+	#if WLN_AVAILABLE
+		dhcp_wln_exchange_delay=DHCP_WLN_EXCHANGE_DELAY_CONST
+	#endif
+end sub
+
+'----------------------------------------------------------------------------
+#if DHCP_DEBUG_PRINT
+sub dhcp_debug_print_status(interface as pl_sock_interfaces,status as en_dhcp_status_codes)
+	dim s as string(64)
+	select case status
+	case DHCP_STATUS_OK: s="OK"
+	case DHCP_STATUS_OUT_OF_SOCKETS: s="out of sockets"
+	case DHCP_STATUS_INVALID_INTERFACE: s="invalid interface"
+	case DHCP_STATUS_INSUFFICIENT_BUFFER_SPACE: s="insufficient buffer space"
+	case DHCP_STATUS_FAILURE: s="DHCP process failed"
+	case DHCP_STATUS_ALREADY_STARTED: s="already started"
+	end select
+	dhcp_debugprint(interface,"ERROR: "+s)
+end sub
+#endif
+
+'------------------------------------------------------------------------------
+#if DHCP_DEBUG_PRINT
+sub dhcp_debugprint(interface as pl_sock_interfaces,byref print_data as string)
+	dim s as string(16)
+
+	#if NET_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_NET then
+			s="net"
+			goto dhcp_debugprint_1
+		end if
+	#endif
+
+	#if WLN_AVAILABLE
+		if interface=PL_SOCK_INTERFACE_WLN then
+			s="wln"
+			goto dhcp_debugprint_1
+		end if
+	#endif
+
+	s=str(interface)+"??"
+
+dhcp_debugprint_1:
+	sys.debugprint(DHCP_STAMP1+s+DHCP_STAMP2+print_data+DHCP_CR_LF)
+end sub
+#endif

@@ -1,0 +1,274 @@
+include "global.tbh"
+
+enum en_get_state
+    GET_STATE_NO_NET,       'waiting for an IP address
+    GET_STATE_IDLE,         'ready; press MD to send a request
+    GET_STATE_DNS,          'resolving SERVER_HOST
+    GET_STATE_CONNECTING,   'TCP connect / TLS handshake in progress
+    GET_STATE_WAITING       'request sent, receiving the response
+end enum
+
+dim get_state as en_get_state
+dim get_sock as byte
+dim dns_socket as byte       'socket handed to the DNS library (it keeps its own copy internally)
+dim server_ip as string(16)
+dim req_ticks as byte
+
+'------------------------------------------------------------------------------
+sub on_sys_init()
+    boot()
+end sub
+
+'------------------------------------------------------------------------------
+sub boot()
+    get_state = GET_STATE_NO_NET
+
+    'HTTPS socket
+    get_sock = sock_get("GET")
+    sock.num = get_sock
+    sock.rxbuffrq(TLS_RX_BUFF)
+    sock.txbuffrq(TLS_TX_BUFF)
+    sys.buffalloc()
+
+    sock.protocol  = PL_SOCK_PROTOCOL_TCP
+    sock.inconmode = PL_SOCK_INCONMODE_NONE
+    sock.reconmode = PL_SOCK_RECONMODE_0
+
+    'DNS socket (the DNS library allocates its own buffers)
+    dns_socket = sock_get("DNS")
+    dns_start(dns_socket)
+
+    sys.debugprint("Buffer pages free after alloc: " + str(sys.freebuffpages) + "\r\n")
+
+#if USE_DHCP
+    'The DHCP library allocates its own socket and buffers; the IP arrives in callback_dhcp_ok
+    sys.debugprint("HTTPS_GET: waiting for DHCP...\r\n")
+    dhcp_start(PL_SOCK_INTERFACE_NET, "", "")
+#else
+    net.ip        = DEVICE_IP
+    net.netmask   = DEVICE_MASK
+    net.gatewayip = DEVICE_GW
+    net_ready()
+#endif
+end sub
+
+'------------------------------------------------------------------------------
+sub net_ready()
+    get_state = GET_STATE_IDLE
+    sys.debugprint("HTTPS_GET ready, IP " + net.ip + ". Press MD to GET https://" + SERVER_HOST + ":" + str(SERVER_PORT) + SERVER_PATH + "\r\n")
+end sub
+
+'------------------------------------------------------------------------------
+sub on_button_pressed()
+    select case get_state
+    case GET_STATE_NO_NET:
+        sys.debugprint("MD: no IP address yet\r\n")
+    case GET_STATE_IDLE:
+        start_request()
+    case else:
+        sys.debugprint("MD: request already in progress\r\n")
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sys_timer()
+    dhcp_proc_timer()
+    dns_proc_timer()
+
+    'Watchdog: abandon a request that has not finished in time
+    if get_state = GET_STATE_DNS or get_state = GET_STATE_CONNECTING or get_state = GET_STATE_WAITING then
+        req_ticks = req_ticks + 1
+        if req_ticks >= REQUEST_TIMEOUT_TICKS then
+            end_request("timed out")
+        end if
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if sock.num = get_sock then
+        https_get_event(newstate, newstatesimple)
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_data_arrival()
+    if sock.num = get_sock then
+        https_get_data()
+    else
+        'both routines ignore sockets that are not theirs
+        dns_proc_data()
+        dhcp_proc_data()
+    end if
+end sub
+
+'==============================================================================
+' Request flow: [DNS] -> TCP connect -> TLS handshake -> GET -> response
+'==============================================================================
+sub start_request()
+    req_ticks = 0
+    server_ip = ""
+
+    if is_ip(SERVER_HOST) = YES then
+        start_connect(SERVER_HOST)
+        exit sub
+    end if
+
+    get_state = GET_STATE_DNS
+    sys.debugprint("Resolving " + SERVER_HOST + " via " + DNS_SERVER + "...\r\n")
+    if dns_connect(PL_SOCK_INTERFACE_NET, DNS_SERVER, 0) <> EN_STATUS_DNS_OK then
+        end_request("dns_connect failed")
+        exit sub
+    end if
+    dns_query(SERVER_HOST)
+end sub
+
+'------------------------------------------------------------------------------
+sub start_connect(ip as string)
+    get_state = GET_STATE_CONNECTING
+    sock.num        = get_sock
+    sock.targetip   = ip
+    sock.targetport = SERVER_PORT
+    sys.debugprint("Connecting to " + ip + ":" + str(SERVER_PORT) + "...\r\n")
+    sock.connect
+end sub
+
+'------------------------------------------------------------------------------
+sub end_request(reason as string)
+    sys.debugprint("Request ended: " + reason + "\r\n")
+    sock.num = get_sock
+    if sock.statesimple <> PL_SSTS_CLOSED then
+        sock.close
+    end if
+    get_state = GET_STATE_IDLE
+end sub
+
+'------------------------------------------------------------------------------
+'YES if s contains only digits and dots (a dotted IP address).
+function is_ip(s as string) as no_yes
+    dim i as byte
+    dim c as byte
+    is_ip = NO
+    if len(s) = 0 then exit function
+    for i = 1 to len(s)
+        c = asc(mid(s, i, 1))
+        if c <> 46 and (c < 48 or c > 57) then exit function    '46 = ".", 48..57 = "0".."9"
+    next i
+    is_ip = YES
+end function
+
+'------------------------------------------------------------------------------
+sub https_get_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        if get_state = GET_STATE_WAITING then
+            sys.debugprint("\r\nResponse complete (server closed the connection)\r\n")
+            get_state = GET_STATE_IDLE
+        else if get_state = GET_STATE_CONNECTING then
+            sys.debugprint("Connection closed (state=" + str(newstate) + ")\r\n")
+            get_state = GET_STATE_IDLE
+        end if
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_AOPENED:
+        sys.debugprint("TCP connected. Starting TLS...\r\n")
+        sock.tlsdeinit
+        romfile.open(CA_CERT)
+        dim tls_res as pl_tls_result = sock.tlsinit(romfile.offset)
+        if tls_res <> PL_TLS_SUCCESS then
+            end_request("tlsinit FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+        tls_res = sock.tlshandshake(SERVER_HOST)
+        if tls_res <> PL_TLS_SUCCESS then
+            end_request("tlshandshake FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+        sys.debugprint("TLS handshake started...\r\n")
+
+    case PL_SST_EST_TLS:
+        sys.debugprint("TLS established. Sending GET " + SERVER_PATH + "\r\n")
+        get_state = GET_STATE_WAITING
+        sock.tlssetdata("GET " + SERVER_PATH + " HTTP/1.1" + chr(13) + chr(10) + "Host: " + SERVER_HOST + chr(13) + chr(10) + "User-Agent: Tibbo-G3" + chr(13) + chr(10) + "Connection: close" + chr(13) + chr(10) + chr(13) + chr(10))
+        sock.send
+
+    case PL_SST_EST_TLS_FAILED:
+        sys.debugprint("TLS handshake FAILED - resetting\r\n")
+        sock.rxclear
+        sock.reset
+        get_state = GET_STATE_IDLE
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub https_get_data()
+    if get_state <> GET_STATE_WAITING then exit sub
+    dim data as string
+    data = sock.tlsgetdata(255)
+    while len(data) > 0
+        sys.debugprint(data)
+        data = sock.tlsgetdata(255)
+    wend
+end sub
+
+'==============================================================================
+' DHCP callbacks (the library does not set the IP itself; we apply it here)
+'==============================================================================
+sub callback_dhcp_ok(renew as no_yes, interface as pl_sock_interfaces, byref ip as string, byref gateway_ip as string, byref netmask as string, lease_time as dword)
+    if renew = YES and net.ip = ip then exit sub
+    net.ip        = ip
+    net.netmask   = netmask
+    net.gatewayip = gateway_ip
+    sys.debugprint("DHCP OK: IP=" + ip + " mask=" + netmask + " GW=" + gateway_ip + "\r\n")
+    if get_state = GET_STATE_NO_NET then net_ready()
+end sub
+
+sub callback_dhcp_failure(interface as pl_sock_interfaces, failure_code as en_dhcp_status_codes)
+    sys.debugprint("DHCP failed (" + str(failure_code) + "), will retry\r\n")
+end sub
+
+sub callback_dhcp_pre_clear_ip(interface as pl_sock_interfaces)
+    sys.debugprint("DHCP: IP address lost\r\n")
+    get_state = GET_STATE_NO_NET
+end sub
+
+sub callback_dhcp_pre_buffrq(required_buff_pages as byte)
+end sub
+
+sub callback_dhcp_buff_released()
+end sub
+
+'==============================================================================
+' DNS callbacks
+'==============================================================================
+sub callback_dns_answer_acquired(return_type as en_dns_return_type, byref return_string as string)
+    'An A record carries the address as 4 raw bytes; keep the first one
+    if return_type = EN_DNS_RET_IP and server_ip = "" then
+        server_ip = ddstr(return_string)
+        sys.debugprint(SERVER_HOST + " -> " + server_ip + "\r\n")
+    end if
+end sub
+
+sub callback_dns_ok()
+    if get_state <> GET_STATE_DNS then exit sub
+    if server_ip = "" then
+        end_request("DNS returned no IP address")
+        exit sub
+    end if
+    start_connect(server_ip)
+end sub
+
+sub callback_dns_failure(status as en_dns_status_codes)
+    sys.debugprint("DNS error (" + str(status) + ")\r\n")
+    'The library retries on its own; the watchdog in on_sys_timer ends the request if it never succeeds
+end sub
+
+sub callback_dns_pre_buffrq(num_of_pages_required as byte)
+end sub
+
+sub callback_dns_buff_released()
+end sub
